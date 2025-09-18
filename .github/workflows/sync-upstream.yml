@@ -1,0 +1,99 @@
+name: Sync Upstream Grok2API
+
+on:
+  # 每天UTC时间00:00自动运行（北京时间08:00）
+  schedule:
+    - cron: '0 0 * * *'
+  
+  # 也可以手动触发
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        token: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Configure Git
+      run: |
+        git config user.name "github-actions[bot]"
+        git config user.email "github-actions[bot]@users.noreply.github.com"
+
+    - name: Add upstream remote and fetch
+      run: |
+        git remote add upstream https://github.com/VeroFess/grok2api.git || true
+        git fetch upstream
+
+    - name: Check if upstream main exists
+      run: |
+        if ! git ls-remote --exit-code --heads upstream main; then
+          echo "Error: upstream/main branch does not exist"
+          echo "Available upstream branches:"
+          git ls-remote --heads upstream
+          exit 1
+        fi
+        echo "upstream/main branch found"
+
+    - name: Check for changes
+      id: check_changes
+      run: |
+        LOCAL=$(git rev-parse HEAD)
+        REMOTE=$(git rev-parse upstream/main)
+        
+        echo "Local commit: $LOCAL"
+        echo "Upstream commit: $REMOTE"
+        
+        if [ "$LOCAL" != "$REMOTE" ]; then
+          echo "changes=true" >> $GITHUB_OUTPUT
+          echo "发现上游 Grok2API 有新的更新"
+        else
+          echo "changes=false" >> $GITHUB_OUTPUT
+          echo "上游 Grok2API 没有新的更新"
+        fi
+
+    - name: Merge upstream changes
+      if: steps.check_changes.outputs.changes == 'true'
+      run: |
+        echo "Merging upstream/main into main"
+        git merge upstream/main --no-edit --allow-unrelated-histories
+        
+    - name: Push changes
+      if: steps.check_changes.outputs.changes == 'true'
+      run: |
+        git push origin main
+        
+    - name: Create Pull Request on conflict
+      if: failure() && steps.check_changes.outputs.changes == 'true'
+      uses: peter-evans/create-pull-request@v5
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        branch: sync-upstream-grok2api-${{ github.run_number }}
+        base: main
+        title: "同步 Grok2API 上游仓库更新"
+        body: |
+          这是一个自动生成的PR，用于同步 Grok2API 上游仓库的更新。
+          
+          由于存在冲突，无法自动合并，请手动解决冲突后合并此PR。
+          
+          - 上游仓库: https://github.com/VeroFess/grok2api
+          - 同步分支: main ← upstream/main
+          
+          ## 更新内容
+          请查看commits了解具体更新内容。
+          
+          ## 注意事项
+          - 这是 Grok2 API 接口项目的更新
+          - 请检查是否有API接口变更
+          - 建议检查配置文件和依赖项变更
+          - 可能包含新的API功能或修复
+          - 合并前建议测试API功能是否正常
+        labels: |
+          sync
+          automated
+          grok2api
+          api
