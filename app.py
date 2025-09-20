@@ -343,23 +343,25 @@ class PlaywrightStatsigManager:
     ) -> Dict[str, str]:
         """Get dynamic headers including captured x-statsig-id and x-xai-request-id"""
         headers = {}
-
         current_time = int(time.time())
-        if (
-            self._cached_statsig_id
-            and self._cache_timestamp
-            and (current_time - self._cache_timestamp) < self._cache_duration
-        ):
-            print("Using cached x-statsig-id")
-            headers["x-statsig-id"] = self._cached_statsig_id
-        else:
 
+        with self._lock:
+            if (
+                self._cached_statsig_id
+                and self._cache_timestamp
+                and (current_time - self._cache_timestamp) < self._cache_duration
+            ):
+                print("Using cached x-statsig-id")
+                headers["x-statsig-id"] = self._cached_statsig_id
+
+        if "x-statsig-id" not in headers:
             print("Capturing fresh x-statsig-id")
             statsig_id = self.capture_statsig_id()
             if statsig_id:
-                self._cached_statsig_id = statsig_id
-                self._cache_timestamp = current_time
-                headers["x-statsig-id"] = statsig_id
+                with self._lock:
+                    self._cached_statsig_id = statsig_id
+                    self._cache_timestamp = current_time
+                    headers["x-statsig-id"] = statsig_id
             else:
                 print("Failed to capture x-statsig-id, using fallback")
                 headers["x-statsig-id"] = (
@@ -391,18 +393,16 @@ def get_statsig_manager() -> PlaywrightStatsigManager:
 
 
 class ModelType(Enum):
-    """Supported Grok model types."""
+    """Supported Grok model types with new architecture."""
 
     GROK_3 = "grok-3"
-    GROK_3_SEARCH = "grok-3-search"
-    GROK_3_IMAGEGEN = "grok-3-imageGen"
-    GROK_3_DEEPSEARCH = "grok-3-deepsearch"
-    GROK_3_DEEPERSEARCH = "grok-3-deepersearch"
-    GROK_3_REASONING = "grok-3-reasoning"
     GROK_4 = "grok-4"
-    GROK_4_REASONING = "grok-4-reasoning"
-    GROK_4_IMAGEGEN = "grok-4-imageGen"
-    GROK_4_DEEPSEARCH = "grok-4-deepsearch"
+
+    GROK_AUTO = "grok-auto"  # grok-3 + MODEL_MODE_AUTO
+    GROK_FAST = "grok-fast"  # grok-3 + MODEL_MODE_FAST
+    GROK_EXPERT = "grok-expert"  # grok-4 + MODEL_MODE_EXPERT
+    GROK_SEARCH = "grok-deepsearch"  # grok-4 + MODEL_MODE_EXPERT + workspaceIds
+    GROK_IMAGE = "grok-image"  # grok-4 + MODEL_MODE_EXPERT + enableImageGeneration
 
 
 class TokenType(Enum):
@@ -466,7 +466,6 @@ def get_dynamic_headers(
     try:
         headers = BASE_HEADERS.copy()
 
-        # Check if dynamic headers are disabled
         if config and config.get("API.DISABLE_DYNAMIC_HEADERS", False):
             print("Dynamic headers disabled, using fallback headers")
             headers["x-xai-request-id"] = str(uuid.uuid4())
@@ -828,11 +827,27 @@ class ConfigurationManager:
 
     def _load_configuration(self) -> Dict[str, Any]:
         """Load configuration from environment variables."""
+
+        model_mapping = {}
+
+        for model in ModelType:
+            alias = model.value
+            if alias in ["grok-3", "grok-auto"]:
+                model_mapping[alias] = "grok-3"
+            elif alias in ["grok-fast"]:
+                model_mapping[alias] = "grok-3"
+            elif alias in ["grok-4", "grok-expert"]:
+                model_mapping[alias] = "grok-4"
+            elif alias in ["grok-search", "grok-deepsearch"]:
+                model_mapping[alias] = "grok-4"
+            elif alias in ["grok-image", "grok-draw"]:
+                model_mapping[alias] = "grok-4"
+            else:
+
+                model_mapping[alias] = alias
+
         return {
-            "MODELS": {
-                model.value: model.value.split("-")[0] + "-" + model.value.split("-")[1]
-                for model in ModelType
-            },
+            "MODELS": model_mapping,
             "API": {
                 "IS_TEMP_CONVERSATION": self._get_bool_env(
                     "IS_TEMP_CONVERSATION", True
@@ -1326,8 +1341,8 @@ class TokenEntry:
     start_call_time: Optional[int] = None
 
     def is_available(self) -> bool:
-        """Check if token is available for use."""
-        return self.request_count < self.max_request_count
+        """Check if token is available for use. Allow over-limit usage with warnings."""
+        return self.request_count < (self.max_request_count * 100)
 
     def can_be_reset(self, expiration_time_ms: int, current_time_ms: int) -> bool:
         """Check if token can be reset based on expiration time."""
@@ -1367,31 +1382,33 @@ class ThreadSafeTokenManager:
         self._expired_tokens: List[Tuple[str, str, int, TokenType]] = []
 
         self._super_limits = {
-            "grok-3": ModelLimits(100, 3 * 60 * 60 * 1000),
-            "grok-3-deepsearch": ModelLimits(30, 24 * 60 * 60 * 1000),
-            "grok-3-deepersearch": ModelLimits(10, 3 * 60 * 60 * 1000),
-            "grok-3-reasoning": ModelLimits(30, 3 * 60 * 60 * 1000),
-            "grok-4": ModelLimits(20, 3 * 60 * 60 * 1000),
+            "grok-3": ModelLimits(50, 12 * 60 * 60 * 1000),
+            "grok-4": ModelLimits(25, 12 * 60 * 60 * 1000),
+            "grok-4-deepsearch": ModelLimits(10, 12 * 60 * 60 * 1000),
         }
 
         self._normal_limits = {
-            "grok-4": ModelLimits(5, int(11.5 * 60 * 60 * 1000)),
-            "grok-3": ModelLimits(20, 3 * 60 * 60 * 1000),
-            "grok-3-deepsearch": ModelLimits(10, 24 * 60 * 60 * 1000),
-            "grok-3-deepersearch": ModelLimits(3, 24 * 60 * 60 * 1000),
-            "grok-3-reasoning": ModelLimits(8, 24 * 60 * 60 * 1000),
+            "grok-3": ModelLimits(5, 12 * 60 * 60 * 1000),
+            "grok-4": ModelLimits(5, 12 * 60 * 60 * 1000),
+            "grok-4-deepsearch": ModelLimits(2, 12 * 60 * 60 * 1000),
         }
 
         self._reset_timer_started = False
         self._load_token_status()
 
-    def _normalize_model_name(self, model: str) -> str:
-        """Normalize model name for consistent lookup."""
-        if model.startswith("grok-") and not any(
-            keyword in model for keyword in ["deepsearch", "deepersearch", "reasoning"]
+        if not self._reset_timer_started and any(
+            self._token_storage.get(m) for m in self._token_storage
         ):
+            self._start_reset_timer()
+
+    def _normalize_model_name(self, model: str) -> str:
+        """Normalize model name for consistent lookup - all aliases map to base models."""
+        if model.startswith("grok-"):
             parts = model.split("-")
-            return f"{parts[0]}-{parts[1]}" if len(parts) >= 2 else model
+            if len(parts) >= 2:
+                base_model = f"{parts[0]}-{parts[1]}"
+                if base_model in ["grok-3", "grok-4"]:
+                    return base_model
         return model
 
     def _get_model_limits(self, token_type: TokenType) -> Dict[str, ModelLimits]:
@@ -1428,9 +1445,45 @@ class ThreadSafeTokenManager:
         """Reconstruct _token_storage from _token_status."""
         try:
             reconstructed_count = 0
-            for sso_value, models_data in self._token_status.items():
-                for model, model_data in models_data.items():
+            migration_count = 0
 
+            for sso_value, models_data in self._token_status.items():
+                is_super = False
+                for model_data in models_data.values():
+                    if model_data.get("isSuper", False):
+                        is_super = True
+                        break
+
+                token_type = TokenType.SUPER if is_super else TokenType.NORMAL
+                model_limits = self._get_model_limits(token_type)
+
+                missing_models = []
+                for model_name, limits in model_limits.items():
+                    if model_name not in models_data:
+                        missing_models.append(model_name)
+
+                if missing_models:
+                    for model_name in missing_models:
+                        limits = model_limits[model_name]
+
+                        models_data[model_name] = {
+                            "isValid": True,
+                            "invalidatedTime": None,
+                            "totalRequestCount": 0,
+                            "isSuper": is_super,
+                            "max_request_count": limits.request_frequency,
+                            "request_count": 0,
+                            "added_time": int(time.time() * 1000),
+                            "start_call_time": None,
+                            "failed_request_count": 0,
+                            "is_expired": False,
+                            "last_failure_time": None,
+                            "last_failure_reason": None,
+                        }
+                        migration_count += 1
+                        print(f"Added missing {model_name} data for token {sso_value[:20]}...")
+
+                for model, model_data in models_data.items():
                     is_super = model_data.get("isSuper", False)
                     token_type = TokenType.SUPER if is_super else TokenType.NORMAL
 
@@ -1468,6 +1521,11 @@ class ThreadSafeTokenManager:
 
             if reconstructed_count > 0:
                 print(f"Reconstructed {reconstructed_count} token entries")
+
+            if migration_count > 0:
+                print(f"Added missing model data to {migration_count} token-model combinations for backward compatibility")
+                self._save_token_status()
+
         except Exception as e:
             print(f"Failed to reconstruct token storage: {e}")
 
@@ -1475,6 +1533,8 @@ class ThreadSafeTokenManager:
         self, model: str, token_string: str, failure_reason: str, status_code: int
     ) -> None:
         """Record a token failure and potentially mark as expired."""
+        need_save = False
+
         with self._lock:
             try:
                 normalized_model = self._normalize_model_name(model)
@@ -1503,7 +1563,7 @@ class ThreadSafeTokenManager:
                             "TokenManager",
                         )
 
-                    self._save_token_status()
+                    need_save = True
                     print(
                         f"Recorded token failure for {model}: {failure_reason} (total failures: {status['failed_request_count']})",
                         "TokenManager",
@@ -1511,6 +1571,12 @@ class ThreadSafeTokenManager:
 
             except Exception as e:
                 print(f"Failed to record token failure: {e}")
+
+        if need_save:
+            try:
+                self._save_token_status()
+            except Exception as e:
+                print(f"Failed to save token status: {e}")
 
     def _is_token_expired(self, token_entry: TokenEntry, model: str) -> bool:
         """Check if a token is marked as expired."""
@@ -1531,6 +1597,8 @@ class ThreadSafeTokenManager:
         self, credential: TokenCredential, is_initialization: bool = False
     ) -> bool:
         """Add token to the management system."""
+        need_save = False
+
         with self._lock:
             try:
                 model_limits = self._get_model_limits(credential.token_type)
@@ -1578,31 +1646,37 @@ class ThreadSafeTokenManager:
                             }
 
                 if not is_initialization:
-                    self._save_token_status()
+                    need_save = True
 
                 print(
                     f"Token added successfully for type: {credential.token_type.value}",
                     "TokenManager",
                 )
-                return True
 
             except Exception as e:
                 print(f"Failed to add token: {e}")
                 return False
 
+        if need_save:
+            try:
+                self._save_token_status()
+            except Exception as e:
+                print(f"Failed to save token status: {e}")
+
+        return True
+
     def get_token_for_model(self, model: str) -> Optional[str]:
         """Get available token for specified model."""
+        token_to_return = None
+        need_save = False
+
         with self._lock:
             normalized_model = self._normalize_model_name(model)
-
-            if normalized_model not in self._token_storage:
-                return None
-
-            tokens = self._token_storage[normalized_model]
+            tokens = self._token_storage.get(normalized_model)
             if not tokens:
                 return None
 
-            for token_entry in tokens:
+            for i, token_entry in enumerate(tokens):
 
                 if self._is_token_expired(token_entry, normalized_model):
                     continue
@@ -1634,13 +1708,78 @@ class ThreadSafeTokenManager:
                     if not self._reset_timer_started:
                         self._start_reset_timer()
 
-                    self._save_token_status()
-                    return token_entry.credential.sso_token
+                    token_to_return = token_entry.credential.sso_token
+                    need_save = True
 
-            return None
+                    if len(tokens) > 1:
+                        tokens.append(tokens.pop(i))
+                    break
+
+            if token_to_return is None:
+                now_ms = int(time.time() * 1000)
+                for i, token_entry in enumerate(tokens):
+                    limits = self._get_model_limits(
+                        token_entry.credential.token_type
+                    ).get(normalized_model)
+                    if not limits:
+                        continue
+
+                    if token_entry.can_be_reset(limits.expiration_time_ms, now_ms):
+
+                        token_entry.reset_usage()
+
+                        try:
+                            sso_value = token_entry.credential.extract_sso_value()
+                            if (
+                                sso_value in self._token_status
+                                and normalized_model in self._token_status[sso_value]
+                            ):
+                                status = self._token_status[sso_value][normalized_model]
+                                status["isValid"] = True
+                                status["invalidatedTime"] = None
+                                status["totalRequestCount"] = 0
+                                status["request_count"] = 0
+                                status["start_call_time"] = None
+                        except Exception as e:
+                            print(
+                                f"Failed to opportunistically reset token status: {e}"
+                            )
+
+                        token_entry.use_token()
+                        token_to_return = token_entry.credential.sso_token
+                        need_save = True
+
+                        try:
+                            sso_value = token_entry.credential.extract_sso_value()
+                            if (
+                                sso_value in self._token_status
+                                and normalized_model in self._token_status[sso_value]
+                            ):
+                                status = self._token_status[sso_value][normalized_model]
+                                status["request_count"] = token_entry.request_count
+                                status["start_call_time"] = token_entry.start_call_time
+                        except Exception as e:
+                            print(
+                                f"Failed to update token status after opportunistic reset: {e}"
+                            )
+
+                        if len(tokens) > 1:
+                            tokens.append(tokens.pop(i))
+
+                        if not self._reset_timer_started:
+                            self._start_reset_timer()
+                        break
+
+        if need_save:
+            try:
+                self._save_token_status()
+            except Exception as e:
+                print(f"Failed to save token status: {e}")
+
+        return token_to_return
 
     def remove_token_from_model(self, model: str, token_string: str) -> bool:
-        """Remove specific token from model."""
+        """Remove specific token from model permanently (will not be reactivated)."""
         with self._lock:
             normalized_model = self._normalize_model_name(model)
 
@@ -1650,29 +1789,36 @@ class ThreadSafeTokenManager:
             tokens = self._token_storage[normalized_model]
             for i, token_entry in enumerate(tokens):
                 if token_entry.credential.sso_token == token_string:
-                    removed_entry = tokens.pop(i)
-
-                    self._expired_tokens.append(
-                        (
-                            token_string,
-                            normalized_model,
-                            int(time.time() * 1000),
-                            removed_entry.credential.token_type,
-                        )
-                    )
-
-                    print(f"Token removed from model {model}")
+                    tokens.pop(i)
+                    print(f"Token permanently removed from model {model}")
                     return True
 
             return False
 
     def get_token_count_for_model(self, model: str) -> int:
-        """Get available token count for model."""
+        """Get schedulable (non-expired) token count for model."""
         with self._lock:
             normalized_model = self._normalize_model_name(model)
-            if normalized_model not in self._token_storage:
-                return 0
-            return len(self._token_storage[normalized_model])
+            tokens = self._token_storage.get(normalized_model, [])
+
+            return sum(
+                1
+                for token in tokens
+                if not self._is_token_expired(token, normalized_model)
+            )
+
+    def get_available_token_count(self, model: str) -> int:
+        """Get immediately available (non-expired and not rate-limited) token count for model."""
+        with self._lock:
+            normalized_model = self._normalize_model_name(model)
+            tokens = self._token_storage.get(normalized_model, [])
+
+            return sum(
+                1
+                for token in tokens
+                if not self._is_token_expired(token, normalized_model)
+                and token.is_available()
+            )
 
     def get_remaining_capacity(self) -> Dict[str, int]:
         """Get remaining request capacity for each model."""
@@ -1728,6 +1874,7 @@ class ThreadSafeTokenManager:
             while True:
                 try:
                     current_time = int(time.time() * 1000)
+                    need_save = False
 
                     with self._lock:
                         tokens_to_remove = []
@@ -1765,6 +1912,7 @@ class ThreadSafeTokenManager:
                                         current_time,
                                     ):
                                         token_entry.reset_usage()
+                                        need_save = True
 
                                         try:
                                             sso_value = (
@@ -1793,7 +1941,11 @@ class ThreadSafeTokenManager:
                                                 "TokenManager",
                                             )
 
-                        self._save_token_status()
+                    if need_save:
+                        try:
+                            self._save_token_status()
+                        except Exception as e:
+                            print(f"Failed to save token status during reset: {e}")
 
                 except Exception as e:
                     print(f"Error in token reset timer: {e}")
@@ -1849,9 +2001,10 @@ class ThreadSafeTokenManager:
 
     def delete_token(self, token_string: str) -> bool:
         """Delete token completely from the system."""
+        removed = False
+
         with self._lock:
             try:
-                removed = False
                 credential = TokenCredential(token_string, TokenType.NORMAL)
                 sso_value = credential.extract_sso_value()
 
@@ -1875,15 +2028,18 @@ class ThreadSafeTokenManager:
                     if token_info[0] != token_string
                 ]
 
-                if removed:
-                    self._save_token_status()
-                    print(f"Token deleted successfully")
-
-                return removed
-
             except Exception as e:
                 print(f"Failed to delete token: {e}")
                 return False
+
+        if removed:
+            try:
+                self._save_token_status()
+                print(f"Token deleted successfully")
+            except Exception as e:
+                print(f"Failed to save token status after deletion: {e}")
+
+        return removed
 
     def get_all_tokens(self) -> List[str]:
         """Get all token strings in the system."""
@@ -2248,7 +2404,7 @@ class MessageContentProcessor:
         self, messages: List[Dict[str, Any]], model: str
     ) -> ProcessedMessage:
         """Process list of messages into a single formatted string."""
-        formatted_messages = ""
+        message_lines = []
         all_file_attachments = []
         message_length = 0
         requires_file_upload = False
@@ -2268,24 +2424,26 @@ class MessageContentProcessor:
             text_content = self.process_content_item(message.get("content", ""))
 
             if text_content or (is_last_message and all_file_attachments):
-                if role == last_role and text_content:
+                if role == last_role and text_content and message_lines:
+
                     last_content += "\n" + text_content
-                    role_header = f"{role.upper()}: "
-                    last_index = formatted_messages.rindex(role_header)
-                    formatted_messages = (
-                        formatted_messages[:last_index]
-                        + f"{role_header}{last_content}\n"
-                    )
+
+                    message_lines[-1] = f"{role.upper()}: {last_content}"
+                    newly_added = "\n" + text_content
                 else:
                     content_to_add = text_content or "[图片]"
-                    formatted_messages += f"{role.upper()}: {content_to_add}\n"
+                    line = f"{role.upper()}: {content_to_add}"
+                    message_lines.append(line)
                     last_content = text_content
                     last_role = role
+                    newly_added = line
 
-            message_length += len(formatted_messages)
+                message_length += len(newly_added)
 
             if message_length >= MESSAGE_LENGTH_LIMIT:
                 requires_file_upload = True
+
+        formatted_messages = "\n".join(message_lines) + "\n" if message_lines else ""
 
         if requires_file_upload:
             last_message = messages[-1] if messages else {}
@@ -2322,7 +2480,7 @@ class MessageContentProcessor:
 
 @dataclass
 class ChatRequestConfig:
-    """Configuration for chat request."""
+    """Configuration for chat request with new architecture."""
 
     model_name: str
     message: str
@@ -2332,6 +2490,14 @@ class ChatRequestConfig:
     enable_reasoning: bool
     deepsearch_preset: str
     temporary_conversation: bool
+
+    model_mode: str = "MODEL_MODE_AUTO"
+    workspace_ids: List[str] = None  # type: ignore
+    token_pool: str = "grok-3"
+
+    def __post_init__(self):
+        if self.workspace_ids is None:
+            self.workspace_ids = []
 
 
 class GrokApiClient:
@@ -2355,37 +2521,64 @@ class GrokApiClient:
 
         return self.config.models[model]
 
-    def determine_search_and_generation_settings(self, model: str) -> tuple:
-        """Determine search and generation settings based on model."""
-        enable_search = model in [
-            "grok-4-deepsearch",
-            "grok-3-search",
-            "grok-3-deepsearch",
-            "grok-3-deepersearch",
-        ]
+    def determine_request_settings(
+        self, requested_model: str, request_data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Determine request settings based on model alias and request data."""
 
-        enable_image_generation = model in ["grok-4-imageGen", "grok-3-imageGen"]
+        settings = {
+            "base_model": "grok-3",
+            "model_mode": "MODEL_MODE_AUTO",
+            "enable_search": False,
+            "enable_image_generation": False,
+            "enable_reasoning": False,
+            "workspace_ids": [],
+            "token_pool": "grok-3",
+        }
 
-        enable_reasoning = model in [
-            "grok-3-reasoning",
-            "grok-4-reasoning",
-            "grok-3-deepsearch",
-            "grok-3-deepersearch",
-            "grok-4-deepsearch",
-        ]
+        if request_data.get("search"):
+            settings["enable_search"] = True
+        if request_data.get("image") or request_data.get("enableImageGeneration"):
+            settings["enable_image_generation"] = True
+        if request_data.get("reasoning") or request_data.get("isReasoning"):
+            settings["enable_reasoning"] = True
 
-        deepsearch_preset = ""
-        if model == "grok-3-deepsearch":
-            deepsearch_preset = "default"
-        elif model == "grok-3-deepersearch":
-            deepsearch_preset = "deeper"
+        model_alias = requested_model.lower()
 
-        return (
-            enable_search,
-            enable_image_generation,
-            enable_reasoning,
-            deepsearch_preset,
-        )
+        if model_alias in ["grok-3", "grok-auto"]:
+            settings["base_model"] = "grok-3"
+            settings["model_mode"] = "MODEL_MODE_AUTO"
+            settings["token_pool"] = "grok-3"
+
+        elif model_alias == "grok-fast":
+            settings["base_model"] = "grok-3"
+            settings["model_mode"] = "MODEL_MODE_FAST"
+            settings["token_pool"] = "grok-3"
+
+        elif model_alias in ["grok-4", "grok-expert"]:
+            settings["base_model"] = "grok-4"
+            settings["model_mode"] = "MODEL_MODE_EXPERT"
+            settings["token_pool"] = "grok-4"
+
+        elif model_alias in ["grok-search", "grok-deepsearch"]:
+            settings["base_model"] = "grok-4"
+            settings["model_mode"] = "MODEL_MODE_EXPERT"
+            settings["enable_search"] = True
+            settings["workspace_ids"] = [str(uuid.uuid4())]
+            settings["token_pool"] = "grok-4-deepsearch"
+
+        elif model_alias in ["grok-image", "grok-draw"]:
+            settings["base_model"] = "grok-4"
+            settings["model_mode"] = "MODEL_MODE_EXPERT"
+            settings["enable_image_generation"] = True
+            settings["token_pool"] = "grok-4"
+
+        if request_data.get("model_mode"):
+            settings["model_mode"] = request_data["model_mode"]
+        if request_data.get("workspace_ids"):
+            settings["workspace_ids"] = request_data["workspace_ids"]
+
+        return settings
 
     def validate_message_requirements(
         self, model: str, messages: List[Dict[str, Any]]
@@ -2402,38 +2595,38 @@ class GrokApiClient:
                 )
 
     def prepare_chat_request(self, request_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Prepare chat request with clean separation of concerns."""
+        """Prepare chat request with new architecture."""
         try:
             model = str(request_data.get("model"))
             messages = request_data.get("messages", [])
 
             normalized_model = self.validate_model_and_request(model, request_data)
 
+            settings = self.determine_request_settings(model, request_data)
+
             self.validate_message_requirements(model, messages)
 
-            (
-                enable_search,
-                enable_image_generation,
-                enable_reasoning,
-                deepsearch_preset,
-            ) = self.determine_search_and_generation_settings(model)
-
-            if model in ["grok-4-imageGen", "grok-3-imageGen", "grok-3-deepsearch"]:
+            if model in ["grok-image", "grok-draw"]:
                 messages = [messages[-1]]
 
-            processed_message = self.message_processor.process_messages(messages, model)
+            processed_message = self.message_processor.process_messages(
+                messages, normalized_model
+            )
 
             request_config = ChatRequestConfig(
-                model_name=normalized_model,
+                model_name=settings["base_model"],
                 message=processed_message.content,
                 file_attachments=processed_message.file_attachments,
-                enable_search=enable_search,
-                enable_image_generation=enable_image_generation,
-                enable_reasoning=enable_reasoning,
-                deepsearch_preset=deepsearch_preset,
+                enable_search=settings["enable_search"],
+                enable_image_generation=settings["enable_image_generation"],
+                enable_reasoning=settings["enable_reasoning"],
+                deepsearch_preset="",
                 temporary_conversation=self.config.get(
                     "API.IS_TEMP_CONVERSATION", False
                 ),
+                model_mode=settings["model_mode"],
+                workspace_ids=settings["workspace_ids"],
+                token_pool=settings["token_pool"],
             )
 
             return self.build_request_payload(request_config)
@@ -2443,12 +2636,7 @@ class GrokApiClient:
             raise
 
     def build_request_payload(self, config: ChatRequestConfig) -> Dict[str, Any]:
-        """Build the final request payload."""
-
-        model_mode = "MODEL_MODE_AUTO"
-        if config.deepsearch_preset in ["default", "deeper"]:
-            model_mode = "MODEL_MODE_EXPERT"
-
+        """Build the final request payload with new architecture."""
         payload = {
             "temporary": config.temporary_conversation,
             "modelName": config.model_name,
@@ -2471,12 +2659,13 @@ class GrokApiClient:
             "responseMetadata": {"requestModelDetails": {"modelId": config.model_name}},
             "disableMemory": False,
             "forceSideBySide": False,
-            "modelMode": model_mode,
+            "modelMode": config.model_mode,
             "isAsyncChat": False,
+            "tokenPool": config.token_pool,
         }
 
-        if config.deepsearch_preset:
-            payload["deepsearchPreset"] = config.deepsearch_preset
+        if config.workspace_ids:
+            payload["workspaceIds"] = config.workspace_ids
 
         return payload
 
@@ -2484,16 +2673,26 @@ class GrokApiClient:
         self, payload: Dict[str, Any], model: str, stream: bool = False
     ) -> Tuple[requests.Response, str]:
         """Make the actual HTTP request to Grok API and return response with used token."""
-        auth_token = self.token_manager.get_token_for_model(model)
+
+        token_pool = payload.get("tokenPool", payload.get("modelName", model))
+
+        auth_token = self.token_manager.get_token_for_model(token_pool)
         if not auth_token:
-            token_count = self.token_manager.get_token_count_for_model(model)
-            if token_count == 0:
+            active_count = self.token_manager.get_token_count_for_model(token_pool)
+            available_count = self.token_manager.get_available_token_count(token_pool)
+
+            if active_count == 0:
                 raise TokenException(
-                    f"No tokens available for model: {model}. Please add tokens or check configuration."
+                    f"No tokens available for model: {token_pool}. Please add tokens or check configuration."
+                )
+            elif available_count == 0:
+                raise TokenException(
+                    f"All tokens for model {token_pool} are currently rate limited. Please try again later."
                 )
             else:
+
                 raise TokenException(
-                    f"All tokens for model {model} are currently rate limited. Please try again later."
+                    f"Unable to obtain token for model {token_pool}. Please try again later."
                 )
 
         cf_clearance = self.config.get("SERVER.CF_CLEARANCE", "")
@@ -2503,7 +2702,9 @@ class GrokApiClient:
             self.config.get("API.PROXY")
         )
 
-        print(f"Making request to Grok API for model: {model}")
+        print(
+            f"Making request to Grok API for model: {model} (using token pool: {token_pool})"
+        )
 
         try:
             response = curl_requests.post(
@@ -2773,7 +2974,7 @@ class ResponseImageHandler:
         self.config = config
         self._cache = {}
         self._cache_lock = threading.Lock()
-        self.max_cache_size = 1024 * 1024 * 16
+        self.max_cache_items = 128
         self.cache_access_order = []
 
     def handle_image_response(self, image_url: str) -> dict:
@@ -2829,13 +3030,18 @@ class ResponseImageHandler:
             raise GrokApiException("No image data retrieved", "NO_IMAGE_DATA")
 
         base64_image = base64.b64encode(image_data).decode("utf-8")
-        content_type = "image/jpeg"
+        ext, content_type = ImageProcessor.get_extension_and_mime_from_header(
+            image_data
+        )
         data_url = f"data:{content_type};base64,{base64_image}"
 
         image_content = {"type": "image_url", "image_url": {"url": data_url}}
 
         with self._cache_lock:
-            if len(self._cache) >= self.max_cache_size and image_url not in self._cache:
+            if (
+                len(self._cache) >= self.max_cache_items
+                and image_url not in self._cache
+            ):
                 oldest_key = self.cache_access_order.pop(0)
                 del self._cache[oldest_key]
 
@@ -3315,7 +3521,10 @@ class StreamProcessor:
 
                     if line_data.get("error"):
                         print(f"API error: {json.dumps(line_data, indent=2)}")
-                        yield json.dumps({"error": "RateLimitError"}) + "\n\n"
+                        yield "data: " + json.dumps(
+                            {"error": "RateLimitError"}
+                        ) + "\n\n"
+                        yield "data: [DONE]\n\n"
                         return
 
                     response_data = line_data.get("result", {}).get("response")
@@ -3504,14 +3713,14 @@ class AuthenticationService:
             raise ValidationException(f"Authentication failed: {e}") from e
 
 
-def create_app(config: ConfigurationManager) -> Flask:
+def create_app(
+    config: ConfigurationManager, token_manager: ThreadSafeTokenManager
+) -> Flask:
     """Create and configure Flask application."""
     app = Flask(__name__)
 
     app.config["SECRET_KEY"] = secrets.token_urlsafe(32)
     app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-
-    token_manager = ThreadSafeTokenManager(config)
     auth_service = AuthenticationService(config, token_manager)
     grok_client = GrokApiClient(config, token_manager)
     response_processor = ModelResponseProcessor(config)
@@ -3601,7 +3810,7 @@ def create_app(config: ConfigurationManager) -> Flask:
                     if response.status_code == 200:
                         break
                     elif response.status_code == 429:
-                        if token_manager.get_token_count_for_model(model) > 1:
+                        if token_manager.get_available_token_count(model) > 0:
                             print("Rate limited, retrying with different token")
                             retry_count += 1
                             continue
@@ -4080,7 +4289,12 @@ def main():
 
         initialize_application(config, token_manager)
 
-        app = create_app(config)
+        try:
+            token_manager._save_token_status()
+        except Exception as e:
+            print(f"Warning: Failed to save token status during initialization: {e}")
+
+        app = create_app(config, token_manager)
 
         port = config.get("SERVER.PORT", 5200)
         print(f"Starting Grok API Gateway on port {port}")

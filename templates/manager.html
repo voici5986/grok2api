@@ -408,6 +408,24 @@
             display: none;
             z-index: 1000;
         }
+
+        /* 超限进度条动画 */
+        @keyframes progress-stripe {
+            from { background-position: 0 0; }
+            to { background-position: 40px 0; }
+        }
+
+        /* 超限状态样式 */
+        .status-over-limit {
+            background-color: rgba(142, 36, 170, 0.1);
+            color: #8e24aa;
+            border: 1px solid #8e24aa;
+        }
+
+        .progress-text.over-limit {
+            color: #8e24aa;
+            font-weight: bold;
+        }
     </style>
 </head>
 
@@ -419,7 +437,7 @@
 
         <div class="overview-panel">
             <div class="header-actions">
-                <h2>Token 管理面板</h2>
+                <h2>Grok API 管理面板</h2>
                 <div class="refresh-icon" id="refreshTokens">
                     <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none"
                         stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -429,6 +447,15 @@
                         <path d="M3 21v-5h5" />
                     </svg>
                 </div>
+            </div>
+
+            <div style="background-color: #e3f2fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; font-size: 14px;">
+                <strong>说明:</strong><br>
+                <strong>以下用量为猜测值，不会被用作真正的限制，如果有谁知道真正的值是多少可以告诉我</strong><br>
+                • <strong>grok-3</strong>: 基础模型 (每12小时5次)<br>
+                • <strong>grok-4</strong>: 专家模型 (每12小时5次)<br>
+                • <strong>grok-4-deepsearch</strong>: 深度搜索 (每12小时2次, 独立限额池)<br>
+                • grok-fast, grok-expert, grok-search, grok-image 等现在均是 grok-3 或者 grok-4 的不同参数，不推荐直接使用 grok-3 或者 grok-4
             </div>
 
             <div class="overview-stats">
@@ -467,20 +494,12 @@
                     <div class="stat-value" id="grok-3-count">0</div>
                 </div>
                 <div class="model-stat">
-                    <div class="stat-label">grok-3-deepsearch 可用次数</div>
-                    <div class="stat-value" id="grok-3-deepsearch-count">0</div>
-                </div>
-                <div class="model-stat">
-                    <div class="stat-label">grok-3-deepersearch 可用次数</div>
-                    <div class="stat-value" id="grok-3-deepersearch-count">0</div>
-                </div>
-                <div class="model-stat">
-                    <div class="stat-label">grok-3-reasoning 可用次数</div>
-                    <div class="stat-value" id="grok-3-reasoning-count">0</div>
-                </div>
-                <div class="model-stat">
                     <div class="stat-label">grok-4 可用次数</div>
                     <div class="stat-value" id="grok-4-count">0</div>
+                </div>
+                <div class="model-stat">
+                    <div class="stat-label">grok-4-deepsearch 可用次数</div>
+                    <div class="stat-value" id="grok-4-deepsearch-count">0</div>
                 </div>
             </div>
         </div>
@@ -511,11 +530,9 @@
     <script>
 
         const modelConfig = {
-            "grok-3": { RequestFrequency: 20, ExpirationTime: 7200000 },
-            "grok-3-deepsearch": { RequestFrequency: 10, ExpirationTime: 86400000 },
-            "grok-3-deepersearch": { RequestFrequency: 3, ExpirationTime: 86400000 },
-            "grok-3-reasoning": { RequestFrequency: 8, ExpirationTime: 86400000 },
-            "grok-4": { RequestFrequency: 5, ExpirationTime: 11.5 * 60 * 60 * 1000 }
+            "grok-3": { RequestFrequency: 5, ExpirationTime: 12 * 60 * 60 * 1000 },      // 5 requests per 12 hours (free tier)
+            "grok-4": { RequestFrequency: 5, ExpirationTime: 12 * 60 * 60 * 1000 },      // 5 requests per 12 hours (free tier)
+            "grok-4-deepsearch": { RequestFrequency: 2, ExpirationTime: 12 * 60 * 60 * 1000 } // 2 deepsearch per 12 hours (free tier)
         };
 
         let tokenMap = {};
@@ -523,8 +540,9 @@
 
 
         function getProgressColor(percentage) {
-            if (percentage > 70) return 'var(--danger-color)';
-            if (percentage > 30) return 'var(--warning-color)';
+            if (percentage > 100) return '#8e24aa';  // 紫色表示超出限额
+            if (percentage > 80) return 'var(--danger-color)';
+            if (percentage > 60) return 'var(--warning-color)';
             return 'var(--success-color)';
         }
 
@@ -537,7 +555,9 @@
                 Object.values(tokenMap).forEach(tokenData => {
                     const modelData = tokenData[modelName];
                     if (modelData && modelData.isValid && !modelData.is_expired) {
-                        const remaining = Math.max(0, maxRequests - (modelData.request_count || modelData.totalRequestCount || 0));
+                        const usedRequests = modelData.request_count || modelData.totalRequestCount || 0;
+                        // 允许负数，表示超出限额的情况
+                        const remaining = maxRequests - usedRequests;
                         modelRemaining[modelName] += remaining;
                     }
                 });
@@ -558,11 +578,24 @@
 
             const modelRemaining = calculateModelRemaining();
 
-            const modelIds = ['grok-3', 'grok-3-deepsearch', 'grok-3-deepersearch', 'grok-3-reasoning', 'grok-4'];
+            const modelIds = ['grok-3', 'grok-4', 'grok-4-deepsearch'];
             modelIds.forEach(modelName => {
                 const countElement = document.getElementById(`${modelName}-count`);
                 if (countElement) {
-                    countElement.textContent = modelRemaining[modelName] || 0;
+                    const remaining = modelRemaining[modelName] || 0;
+                    if (remaining < 0) {
+                        // 超限情况：显示负数并加上特殊样式
+                        countElement.textContent = remaining;
+                        countElement.style.color = '#8e24aa';
+                        countElement.style.fontWeight = 'bold';
+                        countElement.title = `已超出限额 ${Math.abs(remaining)} 次`;
+                    } else {
+                        // 正常情况
+                        countElement.textContent = remaining;
+                        countElement.style.color = 'var(--primary-color)';
+                        countElement.style.fontWeight = '600';
+                        countElement.title = `剩余可用 ${remaining} 次`;
+                    }
                 }
             });
         }
@@ -675,6 +708,11 @@
                 tokenCard.appendChild(tokenHealthInfo);
 
                 Object.entries(modelConfig).forEach(([modelName, config]) => {
+                    const modelData = tokenData[modelName];
+                    if (!modelData) {
+                        return; // Skip this model if no data available for this specific token
+                    }
+
                     const modelRow = document.createElement('div');
                     modelRow.className = 'model-row';
                     const modelNameSpan = document.createElement('div');
@@ -686,19 +724,33 @@
                     progressBar.className = 'progress-bar';
                     const progressBarFill = document.createElement('div');
                     progressBarFill.className = 'progress-bar-fill';
-                    const modelData = tokenData[modelName];
-                    if (!modelData) {
-                        return;
-                    }
                     const requestCount = modelData.request_count || modelData.totalRequestCount || 0;
                     const maxRequests = config.RequestFrequency;
                     const percentage = (requestCount / maxRequests) * 100;
-                    progressBarFill.style.width = `${percentage}%`;
+
+                    // 确保进度条能显示超出100%的情况，但视觉上限制在容器内
+                    const displayPercentage = Math.min(percentage, 150); // 最大显示150%
+                    progressBarFill.style.width = `${displayPercentage}%`;
                     progressBarFill.style.backgroundColor = getProgressColor(percentage);
+
+                    // 如果超出限额，添加特殊样式
+                    if (percentage > 100) {
+                        progressBarFill.style.background = `linear-gradient(45deg, #8e24aa 25%, #ba68c8 25%, #ba68c8 50%, #8e24aa 50%, #8e24aa 75%, #ba68c8 75%)`;
+                        progressBarFill.style.backgroundSize = '20px 20px';
+                        progressBarFill.style.animation = 'progress-stripe 1s linear infinite';
+                    }
+
                     progressBar.appendChild(progressBarFill);
                     const progressText = document.createElement('div');
                     progressText.className = 'progress-text';
-                    progressText.textContent = `${requestCount}/${maxRequests}`;
+
+                    // 显示实际使用次数，如果超限则高亮
+                    if (percentage > 100) {
+                        progressText.innerHTML = `<span style="color: #8e24aa; font-weight: bold;">${requestCount}/${maxRequests}</span>`;
+                        progressText.title = `已超出限额 ${(percentage - 100).toFixed(1)}%`;
+                    } else {
+                        progressText.textContent = `${requestCount}/${maxRequests}`;
+                    }
 
                     const statusBadge = document.createElement('div');
                     statusBadge.className = 'status-badge';
@@ -717,6 +769,14 @@
                         statusBadge.setAttribute('data-expiration-time', config.ExpirationTime);
                         const tooltip = document.createElement('div');
                         tooltip.className = 'tooltip';
+                        statusBadge.appendChild(tooltip);
+                    } else if (percentage > 100) {
+                        // 新增：超限状态
+                        statusBadge.classList.add('status-over-limit');
+                        statusBadge.textContent = '超限';
+                        const tooltip = document.createElement('div');
+                        tooltip.className = 'tooltip';
+                        tooltip.textContent = `已超出限额 ${(percentage - 100).toFixed(1)}%，可能影响服务稳定性`;
                         statusBadge.appendChild(tooltip);
                     } else {
                         statusBadge.classList.add('status-active');
