@@ -1,0 +1,14 @@
+[global]
+admin_username = "admin"
+admin_password = "admin"
+log_level = "INFO"
+temp_max_size_mb = 500
+base_url = ""
+
+[grok]
+api_key = ""
+proxy_url = ""
+cf_clearance = ""
+temporary = true
+filtered_tags = "xaiartifact,xai:tool_usage_card,grok:render"
+x_statsig_id = "ZTpUeXBlRXJyb3I6IENhbm5vdCByZWFkIHByb3BlcnRpZXMgb2YgdW5kZWZpbmVkIChyZWFkaW5nICdjaGlsZE5vZGVzJyk="
