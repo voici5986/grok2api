@@ -4,6 +4,7 @@ import json
 import uuid
 import time
 from typing import Iterator
+
 from app.core.config import setting
 from app.core.exception import GrokApiException
 from app.core.logger import logger
@@ -22,7 +23,7 @@ class GrokResponseProcessor:
     """Grok API 响应处理器"""
 
     @staticmethod
-    async def process_response(response, auth_token: str) -> OpenAIChatCompletionResponse:
+    async def process_normal(response, auth_token: str) -> OpenAIChatCompletionResponse:
         """处理非流式响应"""
         try:
             for chunk in response.iter_lines():
@@ -58,24 +59,21 @@ class GrokResponseProcessor:
                 # 添加生成的图片
                 if images := model_response.get("generatedImageUrls"):
                     for img in images:
-                        # 下载并缓存图片
                         try:
                             cache_path = await image_cache_service.download_image(f"/{img}", auth_token)
                             if cache_path:
-                                # 使用本地缓存路径
                                 img_path = img.replace('/', '-')
                                 base_url = setting.global_config.get("base_url", "")
                                 img_url = f"{base_url}/images/{img_path}" if base_url else f"/images/{img_path}"
                                 content += f"\n![Generated Image]({img_url})"
                             else:
-                                # 缓存失败，使用原始链接
                                 content += f"\n![Generated Image](https://assets.grok.com/{img})"
                         except Exception as e:
                             logger.warning(f"[Processor] 缓存图片失败: {e}")
                             content += f"\n![Generated Image](https://assets.grok.com/{img})"
 
                 # 返回OpenAI格式响应
-                return OpenAIChatCompletionResponse(
+                result = OpenAIChatCompletionResponse(
                     id=f"chatcmpl-{uuid.uuid4()}",
                     object="chat.completion",
                     created=int(time.time()),
@@ -90,11 +88,17 @@ class GrokResponseProcessor:
                     )],
                     usage=None
                 )
+                response.close()
+                return result
 
             raise GrokApiException("无响应数据", "NO_RESPONSE")
 
         except json.JSONDecodeError as e:
             raise GrokApiException(f"JSON解析失败: {e}", "JSON_ERROR") from e
+        finally:
+            # 确保响应对象被关闭
+            if hasattr(response, 'close'):
+                response.close()
 
     @staticmethod
     async def process_stream(response, auth_token: str) -> Iterator[str]:

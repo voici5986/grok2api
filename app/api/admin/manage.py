@@ -286,7 +286,7 @@ async def list_tokens(authenticated: bool = Depends(verify_admin_session)) -> To
     try:
         logger.debug("[Admin] 开始获取Token列表")
 
-        all_tokens_data = token_manager.get_all_token()
+        all_tokens_data = token_manager.get_tokens()
         token_list: List[TokenInfo] = []
 
         # 处理普通Token
@@ -556,7 +556,7 @@ async def get_stats(authenticated: bool = Depends(verify_admin_session)) -> Dict
     try:
         logger.debug("[Admin] 开始获取统计信息")
 
-        all_tokens_data = token_manager.get_all_token()
+        all_tokens_data = token_manager.get_tokens()
 
         # 统计普通Token
         normal_tokens = all_tokens_data.get(TokenType.NORMAL.value, {})
