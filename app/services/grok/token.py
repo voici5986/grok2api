@@ -2,11 +2,12 @@
 
 import json
 import time
-import threading
+import asyncio
 from pathlib import Path
 from typing import Dict, Any, Optional, Tuple
 
-from curl_cffi import requests as curl_requests
+import aiofiles
+from curl_cffi.requests import AsyncSession
 
 from app.models.grok_models import TokenType, Models
 from app.core.exception import GrokApiException
@@ -35,14 +36,12 @@ class GrokTokenManager:
     """
     
     _instance: Optional['GrokTokenManager'] = None
-    _lock = threading.Lock()
+    _lock = asyncio.Lock()
 
     def __new__(cls) -> 'GrokTokenManager':
         """单例模式实现"""
         if cls._instance is None:
-            with cls._lock:
-                if cls._instance is None:
-                    cls._instance = super().__new__(cls)
+            cls._instance = super().__new__(cls)
         return cls._instance
 
     def __init__(self):
@@ -51,16 +50,17 @@ class GrokTokenManager:
             return
 
         self.token_file = Path(__file__).parents[3] / "data" / "token.json"
-        self._file_lock = threading.Lock()
+        self._file_lock = asyncio.Lock()
         self.token_file.parent.mkdir(parents=True, exist_ok=True)
 
-        self._load_token_data()
+        # 同步加载初始数据
+        self._load_token_data_sync()
         self._initialized = True
 
         logger.debug(f"[Token] 管理器初始化完成，文件: {self.token_file}")
 
-    def _load_token_data(self) -> None:
-        """加载Token数据"""
+    def _load_token_data_sync(self) -> None:
+        """同步加载Token数据（仅用于初始化）"""
         default_data = {
             TokenType.NORMAL.value: {},
             TokenType.SUPER.value: {}
@@ -72,18 +72,17 @@ class GrokTokenManager:
                     self.token_data = json.load(f)
             else:
                 self.token_data = default_data
-                self._save_token_data()
                 logger.debug("[Token] 创建新的Token数据文件")
         except (json.JSONDecodeError, IOError) as e:
             logger.error(f"[Token] 加载Token数据失败: {str(e)}")
             self.token_data = default_data
 
-    def _save_token_data(self) -> None:
-        """保存Token数据到文件"""
+    async def _save_token_data(self) -> None:
+        """异步保存Token数据到文件"""
         try:
-            with self._file_lock:
-                with open(self.token_file, "w", encoding="utf-8") as f:
-                    json.dump(self.token_data, f, indent=2, ensure_ascii=False)
+            async with self._file_lock:
+                async with aiofiles.open(self.token_file, "w", encoding="utf-8") as f:
+                    await f.write(json.dumps(self.token_data, indent=2, ensure_ascii=False))
         except IOError as e:
             logger.error(f"[Token] 保存Token数据失败: {str(e)}")
             raise GrokApiException(
@@ -115,10 +114,10 @@ class GrokTokenManager:
             return {"http": proxy_url, "https": proxy_url}
         return {}
 
-    def add_token(self, tokens: list[str], token_type: TokenType) -> None:
+    async def add_token(self, tokens: list[str], token_type: TokenType) -> None:
         """
         添加Token到管理器
-        
+
         Args:
             tokens: Token列表
             token_type: Token类型
@@ -132,7 +131,7 @@ class GrokTokenManager:
             if not token or not token.strip():
                 logger.debug("[Token] 跳过空的Token")
                 continue
-                
+
             self.token_data[token_type.value][token] = {
                 "createdTime": int(time.time() * 1000),
                 "remainingQueries": -1,
@@ -143,14 +142,14 @@ class GrokTokenManager:
                 "lastFailureReason": None
             }
             added_count += 1
-            
-        self._save_token_data()
+
+        await self._save_token_data()
         logger.info(f"[Token] 成功添加 {added_count} 个 {token_type.value} Token")
-    
-    def delete_token(self, tokens: list[str], token_type: TokenType) -> None:
+
+    async def delete_token(self, tokens: list[str], token_type: TokenType) -> None:
         """
         删除指定的Token
-        
+
         Args:
             tokens: 要删除的Token列表
             token_type: Token类型
@@ -167,7 +166,7 @@ class GrokTokenManager:
             else:
                 logger.debug(f"[Token] Token不存在: {token[:10]}...")
 
-        self._save_token_data()
+        await self._save_token_data()
         logger.info(f"[Token] 成功删除 {deleted_count} 个 {token_type.value} Token")
     
     def get_all_token(self) -> Dict[str, Any]:
@@ -263,7 +262,7 @@ class GrokTokenManager:
         logger.debug(f"[Token] 为模型 {model} 选择Token ({status_text})")
         return max_token_key
     
-    def check_limits(self, auth_token: str, model: str) -> Optional[Dict[str, Any]]:
+    async def check_limits(self, auth_token: str, model: str) -> Optional[Dict[str, Any]]:
         """检查并更新模型速率限制"""
         try:
             rate_limit_model_name = Models.to_rate_limit(model)
@@ -277,24 +276,29 @@ class GrokTokenManager:
             headers = get_dynamic_headers("/rest/rate-limits")
             headers["Cookie"] = cookie
 
-            # 发送请求
-            response = curl_requests.post(
-                RATE_LIMIT_ENDPOINT,
-                headers=headers,
-                json=payload,
-                impersonate=IMPERSONATE_BROWSER,
-                timeout=REQUEST_TIMEOUT,
-                **self._get_proxy_config()
-            )
+            # 获取代理配置
+            proxy_url = setting.grok_config.get("proxy_url", "")
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
-            if response.status_code == 200:
-                rate_limit_data = response.json()
-                logger.debug(f"[Token] 成功获取速率限制信息")
-                self._save_to_storage(auth_token, model, rate_limit_data)
-                return rate_limit_data
-            else:
-                logger.warning(f"[Token] 获取速率限制失败，状态码: {response.status_code}")
-                return None
+            # 发送异步请求
+            async with AsyncSession() as session:
+                response = await session.post(
+                    RATE_LIMIT_ENDPOINT,
+                    headers=headers,
+                    json=payload,
+                    impersonate=IMPERSONATE_BROWSER,
+                    timeout=REQUEST_TIMEOUT,
+                    proxies=proxies
+                )
+
+                if response.status_code == 200:
+                    rate_limit_data = response.json()
+                    logger.debug(f"[Token] 成功获取速率限制信息")
+                    await self._save_to_storage(auth_token, model, rate_limit_data)
+                    return rate_limit_data
+                else:
+                    logger.warning(f"[Token] 获取速率限制失败，状态码: {response.status_code}")
+                    return None
 
         except Exception as e:
             logger.error(f"[Token] 检查速率限制时发生错误: {str(e)}")
@@ -312,7 +316,7 @@ class GrokTokenManager:
             logger.error(f"[Token] 解析剩余Token数量时发生错误: {str(e)}")
             return 0
     
-    def _save_to_storage(self, auth_token: str, model: str, data: Dict[str, Any]) -> None:
+    async def _save_to_storage(self, auth_token: str, model: str, data: Dict[str, Any]) -> None:
         """存储速率限制信息到token.json"""
         try:
             sso_value = self._extract_sso_value(auth_token)
@@ -327,13 +331,13 @@ class GrokTokenManager:
                 normal_remaining = data.get("remainingTokens", -1)
                 heavy_remaining = -1
 
-            self.update_limits(sso_value, normal_remaining, heavy_remaining)
+            await self.update_limits(sso_value, normal_remaining, heavy_remaining)
             logger.info(f"[Token] 已更新限制: sso={sso_value[:10]}..., 通用={normal_remaining}, heavy={heavy_remaining}")
 
         except Exception as e:
             logger.error(f"[Token] 存储速率限制信息时发生错误: {str(e)}")
-    
-    def update_limits(self, sso_value: str, normal: int = None, heavy: int = None) -> None:
+
+    async def update_limits(self, sso_value: str, normal: int = None, heavy: int = None) -> None:
         """更新Token限制信息"""
         try:
             for token_type in [TokenType.NORMAL.value, TokenType.SUPER.value]:
@@ -342,8 +346,8 @@ class GrokTokenManager:
                         self.token_data[token_type][sso_value]["remainingQueries"] = normal
                     if heavy is not None:
                         self.token_data[token_type][sso_value]["heavyremainingQueries"] = heavy
-                    
-                    self._save_token_data()
+
+                    await self._save_token_data()
                     logger.info(f"[Token] 已更新Token {sso_value[:10]}... 的限制信息")
                     return
 
@@ -352,7 +356,7 @@ class GrokTokenManager:
         except Exception as e:
             logger.error(f"[Token] 更新Token限制时发生错误: {str(e)}")
     
-    def record_token_failure(self, auth_token: str, status_code: int, error_message: str) -> None:
+    async def record_token_failure(self, auth_token: str, status_code: int, error_message: str) -> None:
         """记录Token失败信息
 
         错误码说明：
@@ -398,12 +402,12 @@ class GrokTokenManager:
                     f"(连续401错误{token_data['failedCount']}次)"
                 )
 
-            self._save_token_data()
+            await self._save_token_data()
 
         except Exception as e:
             logger.error(f"[Token] 记录Token失败信息时发生错误: {str(e)}")
-    
-    def reset_token_failure(self, auth_token: str) -> None:
+
+    async def reset_token_failure(self, auth_token: str) -> None:
         """重置Token失败计数
 
         当Token成功完成请求时调用此方法，用于清除失败记录。
@@ -427,7 +431,7 @@ class GrokTokenManager:
                 token_data["lastFailureTime"] = None
                 token_data["lastFailureReason"] = None
 
-                self._save_token_data()
+                await self._save_token_data()
                 logger.info(f"[Token] Token {sso_value[:10]}... 失败计数已重置")
 
         except Exception as e:

@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import threading
 from typing import Dict, List, Tuple, Any
 
 from curl_cffi import requests as curl_requests
@@ -42,7 +41,7 @@ class GrokClient:
         model_name, model_mode = Models.to_grok(model)
 
         # 上传图片并获取附件ID列表
-        image_attachments = GrokClient._upload_images(image_urls, auth_token)
+        image_attachments = await GrokClient._upload_images(image_urls, auth_token)
 
         # 构建Grok请求载荷
         payload = GrokClient._build_payload(content, model_name, model_mode, image_attachments)
@@ -75,16 +74,18 @@ class GrokClient:
         return "".join(content_parts), image_urls
 
     @staticmethod
-    def _upload_images(image_urls: List[str], auth_token: str) -> List[str]:
+    async def _upload_images(image_urls: List[str], auth_token: str) -> List[str]:
         """上传图片并返回附件ID列表"""
         image_attachments = []
-        for url in image_urls:
-            try:
-                image_id = ImageUploadManager.upload(url, auth_token)
-                if image_id:
-                    image_attachments.append(image_id)
-            except Exception as e:
-                logger.warning(f"[Client] 图片上传失败: {url}, 错误: {e}")
+        # 并发上传所有图片
+        tasks = [ImageUploadManager.upload(url, auth_token) for url in image_urls]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for url, result in zip(image_urls, results):
+            if isinstance(result, Exception):
+                logger.warning(f"[Client] 图片上传失败: {url}, 错误: {result}")
+            elif result:
+                image_attachments.append(result)
 
         return image_attachments
 
@@ -150,10 +151,10 @@ class GrokClient:
                 GrokClient._handle_error_response(response, auth_token)
 
             # 请求成功，重置失败计数
-            token_manager.reset_token_failure(auth_token)
+            asyncio.create_task(token_manager.reset_token_failure(auth_token))
 
             # 处理并返回响应
-            return GrokClient._process_response(response, auth_token, model, stream)
+            return await GrokClient._process_response(response, auth_token, model, stream)
 
         except curl_requests.RequestsError as e:
             raise GrokApiException(f"网络错误: {e}", "NETWORK_ERROR") from e
@@ -190,7 +191,7 @@ class GrokClient:
             error_message = error_data[:200] if error_data else "未知错误"
 
         # 记录Token失败
-        token_manager.record_token_failure(auth_token, response.status_code, error_message)
+        asyncio.create_task(token_manager.record_token_failure(auth_token, response.status_code, error_message))
 
         raise GrokApiException(
             f"请求失败: {response.status_code} - {error_message}",
@@ -199,26 +200,23 @@ class GrokClient:
         )
 
     @staticmethod
-    def _process_response(response, auth_token: str, model: str, stream: bool):
+    async def _process_response(response, auth_token: str, model: str, stream: bool):
         """处理API响应"""
         if stream:
-            # 流式响应：异步更新速率限制
+            # 流式响应：返回异步生成器，在后台更新速率限制
             result = GrokResponseProcessor.process_stream(response, auth_token)
-            threading.Thread(
-                target=lambda: GrokClient._update_rate_limits(auth_token, model),
-                daemon=True
-            ).start()
+            asyncio.create_task(GrokClient._update_rate_limits_async(auth_token, model))
         else:
-            # 非流式响应：同步更新速率限制
-            result = GrokResponseProcessor.process_response(response, auth_token)
-            GrokClient._update_rate_limits(auth_token, model)
+            # 非流式响应：等待处理完成后更新速率限制
+            result = await GrokResponseProcessor.process_response(response, auth_token)
+            asyncio.create_task(GrokClient._update_rate_limits_async(auth_token, model))
 
         return result
 
     @staticmethod
-    def _update_rate_limits(auth_token: str, model: str):
-        """更新速率限制信息"""
+    async def _update_rate_limits_async(auth_token: str, model: str):
+        """异步更新速率限制信息"""
         try:
-            token_manager.check_limits(auth_token, model)
+            await token_manager.check_limits(auth_token, model)
         except Exception as e:
             logger.error(f"[Client] 更新速率限制失败: {e}")

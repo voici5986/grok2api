@@ -4,7 +4,7 @@ import base64
 import re
 from urllib.parse import urlparse
 
-from curl_cffi import requests as curl_requests
+from curl_cffi.requests import AsyncSession
 
 from app.services.grok.statsig import get_dynamic_headers
 from app.core.exception import GrokApiException
@@ -23,12 +23,12 @@ class ImageUploadManager:
     """
 
     @staticmethod
-    def upload(image_input: str, auth_token: str) -> str:
+    async def upload(image_input: str, auth_token: str) -> str:
         """上传图片到Grok，支持Base64或URL"""
         try:
             if ImageUploadManager._is_url(image_input):
                 # 下载 URL 图片
-                image_buffer, mime_type = ImageUploadManager._download(image_input)
+                image_buffer, mime_type = await ImageUploadManager._download(image_input)
 
                 # 获取图片信息
                 file_name, _ = ImageUploadManager._get_info("", mime_type)
@@ -53,27 +53,29 @@ class ImageUploadManager:
 
             cf_clearance = setting.grok_config.get("cf_clearance", "")
             cookie = f"{auth_token};{cf_clearance}" if cf_clearance else auth_token
-            proxy_config = {"http": setting.grok_config.get("proxy_url", ""), "https": setting.grok_config.get("proxy_url", "")} if setting.grok_config.get("proxy_url") else {}
+            proxy_url = setting.grok_config.get("proxy_url", "")
+            proxies = {"http": proxy_url, "https": proxy_url} if proxy_url else None
 
-            # 发送请求
-            response = curl_requests.post(
-                "https://grok.com/rest/app-chat/upload-file",
-                headers={
-                    **get_dynamic_headers("/rest/app-chat/upload-file"),
-                    "Cookie": cookie,
-                },
-                json=upload_data,
-                impersonate="chrome133a",
-                timeout=30,
-                **proxy_config,
-            )
+            # 发送异步请求
+            async with AsyncSession() as session:
+                response = await session.post(
+                    "https://grok.com/rest/app-chat/upload-file",
+                    headers={
+                        **get_dynamic_headers("/rest/app-chat/upload-file"),
+                        "Cookie": cookie,
+                    },
+                    json=upload_data,
+                    impersonate="chrome133a",
+                    timeout=30,
+                    proxies=proxies,
+                )
 
-            # 检查响应
-            if response.status_code == 200:
-                result = response.json()
-                file_id = result.get("fileMetadataId", "")
-                logger.debug(f"[Upload] 图片上传成功，文件ID: {file_id}")
-                return file_id
+                # 检查响应
+                if response.status_code == 200:
+                    result = response.json()
+                    file_id = result.get("fileMetadataId", "")
+                    logger.debug(f"[Upload] 图片上传成功，文件ID: {file_id}")
+                    return file_id
 
             return ""
 
@@ -92,20 +94,20 @@ class ImageUploadManager:
             return False
 
     @staticmethod
-    def _download(url: str) -> tuple[str, str]:
-
+    async def _download(url: str) -> tuple[str, str]:
         try:
-            response = curl_requests.get(url, timeout=5)
-            response.raise_for_status()
+            async with AsyncSession() as session:
+                response = await session.get(url, timeout=5)
+                response.raise_for_status()
 
-            # 获取内容类型
-            content_type = response.headers.get('content-type', 'image/jpeg')
-            if not content_type.startswith('image/'):
-                content_type = 'image/jpeg'
+                # 获取内容类型
+                content_type = response.headers.get('content-type', 'image/jpeg')
+                if not content_type.startswith('image/'):
+                    content_type = 'image/jpeg'
 
-            # 转换为 Base64
-            image_base64 = base64.b64encode(response.content).decode('utf-8')
-            return image_base64, content_type
+                # 转换为 Base64
+                image_base64 = base64.b64encode(response.content).decode('utf-8')
+                return image_base64, content_type
         except Exception as e:
             logger.warning(f"[Upload] 下载图片失败: {e}")
             return "", ""

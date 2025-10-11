@@ -3,7 +3,6 @@
 import json
 import uuid
 import time
-import asyncio
 from typing import Iterator
 from app.core.config import setting
 from app.core.exception import GrokApiException
@@ -19,26 +18,11 @@ from app.models.openai_schema import (
 from app.services.grok.image_cache import image_cache_service
 
 
-def _safe_run_async(coro):
-    """安全地运行异步协程，无论是否有事件循环"""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            # 如果循环正在运行，使用 ensure_future 调度任务
-            return asyncio.ensure_future(coro)
-        else:
-            # 循环存在但未运行，直接运行
-            return loop.run_until_complete(coro)
-    except RuntimeError:
-        # 没有事件循环，创建新的
-        return asyncio.run(coro)
-
-
 class GrokResponseProcessor:
     """Grok API 响应处理器"""
 
     @staticmethod
-    def process_response(response, auth_token: str) -> OpenAIChatCompletionResponse:
+    async def process_response(response, auth_token: str) -> OpenAIChatCompletionResponse:
         """处理非流式响应"""
         try:
             for chunk in response.iter_lines():
@@ -76,7 +60,7 @@ class GrokResponseProcessor:
                     for img in images:
                         # 下载并缓存图片
                         try:
-                            cache_path = _safe_run_async(image_cache_service.download_image(f"/{img}", auth_token))
+                            cache_path = await image_cache_service.download_image(f"/{img}", auth_token)
                             if cache_path:
                                 # 使用本地缓存路径
                                 img_path = img.replace('/', '-')
@@ -113,7 +97,7 @@ class GrokResponseProcessor:
             raise GrokApiException(f"JSON解析失败: {e}", "JSON_ERROR") from e
 
     @staticmethod
-    def process_stream(response, auth_token: str) -> Iterator[str]:
+    async def process_stream(response, auth_token: str) -> Iterator[str]:
         """处理流式响应"""
         is_image = False
         is_thinking = False
@@ -182,8 +166,8 @@ class GrokResponseProcessor:
                             content = ""
                             for img in model_resp.get("generatedImageUrls", []):
                                 try:
-                                    # 异步下载并缓存图片（不阻塞）
-                                    _safe_run_async(image_cache_service.download_image(f"/{img}", auth_token))
+                                    # 异步下载并缓存图片
+                                    await image_cache_service.download_image(f"/{img}", auth_token)
                                     # 使用本地缓存路径
                                     img_path = img.replace('/', '-')
                                     base_url = setting.global_config.get("base_url", "")
